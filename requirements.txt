@@ -1,0 +1,1 @@
+fastapi==0.115.12\nuvicorn==0.34.0\n
