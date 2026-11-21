@@ -1,14 +1,18 @@
 
 import json
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 TICKERS = ["SBER", "LKOH", "YDEX", "ROSN", "GMKN", "OZON", "VTBR", "T"]
+BOARD = "TQBR"
+MAX_QUOTE_AGE_MINUTES = 30
 
 
 def get_market_snapshot():
     quotes = []
     errors = []
+    now = datetime.now(timezone.utc)
 
     for ticker in TICKERS:
         try:
@@ -16,14 +20,14 @@ def get_market_snapshot():
                 f"https://iss.moex.com/iss/engines/stock/"
                 f"markets/shares/securities/{ticker}.json?"
                 "iss.only=marketdata,securities&"
-                "marketdata.columns=SECID,BOARDID,LAST,LCURRENTPRICE,"
-                "MARKETPRICE,TRADEDATE,TRADETIME&"
+                "marketdata.columns=SECID,BOARDID,LAST,MARKETPRICE,"
+                "PREVPRICE,TRADEDATE,TRADETIME,TIME&"
                 "securities.columns=SECID,PREVPRICE"
             )
 
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "TradingAgents/2.0"}
+                headers={"User-Agent": "TradingAgents/3.0"}
             )
 
             with urllib.request.urlopen(req, timeout=10) as response:
@@ -34,47 +38,94 @@ def get_market_snapshot():
 
             md_columns = md.get("columns", [])
             md_rows = md.get("data", [])
-
             sec_columns = sec.get("columns", [])
             sec_rows = sec.get("data", [])
 
             if not md_rows:
-                errors.append({"ticker": ticker, "error": "No marketdata rows"})
+                errors.append({"ticker": ticker, "error": "No market data"})
                 continue
 
-            md_item = dict(zip(md_columns, md_rows[0]))
+            # Select only the specified board.
+            board_rows = [
+                dict(zip(md_columns, row))
+                for row in md_rows
+                if dict(zip(md_columns, row)).get("BOARDID") == BOARD
+            ]
+
+            if not board_rows:
+                errors.append({
+                    "ticker": ticker,
+                    "error": f"No quote on board {BOARD}"
+                })
+                continue
+
+            item = board_rows[0]
             sec_item = dict(zip(sec_columns, sec_rows[0])) if sec_rows else {}
 
-            price = (
-                md_item.get("LAST")
-                or md_item.get("LCURRENTPRICE")
-                or md_item.get("MARKETPRICE")
-            )
+            price = item.get("LAST")
+            if price is None:
+                price = item.get("MARKETPRICE")
 
-            previous = sec_item.get("PREVPRICE")
+            previous = item.get("PREVPRICE")
+            if previous is None:
+                previous = sec_item.get("PREVPRICE")
 
             if price is None or float(price) <= 0:
                 errors.append({"ticker": ticker, "error": "Invalid price"})
                 continue
 
+            trade_date = item.get("TRADEDATE")
+            trade_time = item.get("TRADETIME") or item.get("TIME")
+            quote_time = None
+            age_minutes = None
+
+            if trade_date and trade_time:
+                try:
+                    local_time = datetime.strptime(
+                        f"{trade_date} {trade_time}",
+                        "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=ZoneInfo("Europe/Moscow"))
+
+                    quote_time = local_time.astimezone(timezone.utc)
+                    age_minutes = (now - quote_time).total_seconds() / 60
+                except ValueError:
+                    quote_time = None
+
+            fresh = (
+                age_minutes is not None
+                and -2 <= age_minutes <= MAX_QUOTE_AGE_MINUTES
+            )
+
             quotes.append({
                 "ticker": ticker,
                 "price": float(price),
                 "previous": float(previous) if previous is not None else None,
-                "board": md_item.get("BOARDID"),
-                "trade_date": md_item.get("TRADEDATE"),
-                "trade_time": md_item.get("TRADETIME")
+                "board": BOARD,
+                "trade_date": trade_date,
+                "trade_time": trade_time,
+                "quote_time_utc": quote_time.isoformat() if quote_time else None,
+                "age_minutes": round(age_minutes, 2) if age_minutes is not None else None,
+                "fresh": fresh
             })
 
         except Exception as e:
             errors.append({"ticker": ticker, "error": str(e)})
 
     valid = [q for q in quotes if q.get("price") is not None]
+    fresh_quotes = [q for q in valid if q.get("fresh")]
 
     return {
-        "status": "ok" if valid else "no_verified_quotes",
+        "status": "ok" if fresh_quotes else "no_fresh_quotes",
         "source": "MOEX ISS",
-        "as_of": datetime.now(timezone.utc).isoformat(),
+        "board": BOARD,
+        "as_of": now.isoformat(),
+        "market_data_valid": bool(fresh_quotes),
         "quotes": valid,
-        "errors": errors
+        "fresh_quotes": fresh_quotes,
+        "errors": errors,
+        "rules": {
+            "required_board": BOARD,
+            "max_quote_age_minutes": MAX_QUOTE_AGE_MINUTES,
+            "stale_quotes_block_trading": True
+        }
     }
