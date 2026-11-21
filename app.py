@@ -1,7 +1,9 @@
+
 from fastapi import FastAPI
 import os
+
 from agents import run_committee
-from ledger import init_db, latest_report
+from ledger import init_db, latest_report, portfolio_value
 from provider import get_market_snapshot
 
 app = FastAPI(title="Trading Agents v2 - PAPER ONLY")
@@ -17,7 +19,7 @@ def home():
         "mode": "PAPER_ONLY",
         "real_orders": False,
         "status": "online",
-        "agents": ["Bull", "Bear", "Owl", "Director"]
+        "agents": ["Bull", "Bear", "Owl", "Risk Manager", "Director"]
     }
 
 
@@ -28,7 +30,7 @@ def health():
         "mode": "PAPER_ONLY",
         "data_provider": "MOEX ISS",
         "real_orders": False,
-        "agent_count": 4
+        "agent_count": 5
     }
 
 
@@ -45,3 +47,8 @@ def cycle():
 @app.get("/report")
 def report():
     return latest_report(DB)
+
+
+@app.get("/portfolio")
+def portfolio():
+    return portfolio_value(DB)
