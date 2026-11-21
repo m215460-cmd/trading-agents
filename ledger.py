@@ -1,4 +1,3 @@
-
 import sqlite3
 import json
 import math
@@ -42,63 +41,64 @@ def valid_symbol(symbol):
 
 def init_db(path):
     con = connect(path)
+    try:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                result_json TEXT NOT NULL
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS cycles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            result_json TEXT NOT NULL
-        )
-    """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                symbol TEXT PRIMARY KEY,
+                qty REAL NOT NULL,
+                avg_price REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS paper_positions (
-            symbol TEXT PRIMARY KEY,
-            qty REAL NOT NULL,
-            avg_price REAL NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS paper_portfolio (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cash REAL NOT NULL,
+                initial_capital REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS paper_portfolio (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            cash REAL NOT NULL,
-            initial_capital REAL NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                price REAL NOT NULL,
+                commission REAL NOT NULL,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                note TEXT
+            )
+        """)
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS paper_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            qty REAL NOT NULL,
-            price REAL NOT NULL,
-            commission REAL NOT NULL,
-            realized_pnl REAL NOT NULL DEFAULT 0,
-            note TEXT
-        )
-    """)
+        row = con.execute(
+            "SELECT id FROM paper_portfolio WHERE id=1"
+        ).fetchone()
 
-    row = con.execute(
-        "SELECT id FROM paper_portfolio WHERE id=1"
-    ).fetchone()
+        if not row:
+            now = utc_now()
+            con.execute(
+                "INSERT INTO paper_portfolio "
+                "(id,cash,initial_capital,created_at,updated_at) "
+                "VALUES (1,?,?,?,?)",
+                (INITIAL_CAPITAL, INITIAL_CAPITAL, now, now)
+            )
 
-    if not row:
-        now = utc_now()
-        con.execute(
-            "INSERT INTO paper_portfolio "
-            "(id,cash,initial_capital,created_at,updated_at) "
-            "VALUES (1,?,?,?,?)",
-            (INITIAL_CAPITAL, INITIAL_CAPITAL, now, now)
-        )
-
-    con.commit()
-    con.close()
+        con.commit()
+    finally:
+        con.close()
 
 
 def save_cycle(path, result):
@@ -113,31 +113,34 @@ def save_cycle(path, result):
         con.close()
 
 
+def daily_realized_pnl_from_connection(con):
+    today = datetime.now(MOSCOW).date().isoformat()
+
+    rows = con.execute(
+        "SELECT ts,realized_pnl FROM paper_trades WHERE side='SELL'"
+    ).fetchall()
+
+    total = 0.0
+
+    for row in rows:
+        ts = row["ts"]
+        try:
+            trade_date = datetime.fromisoformat(ts).astimezone(
+                MOSCOW
+            ).date().isoformat()
+        except Exception:
+            trade_date = ts[:10]
+
+        if trade_date == today:
+            total += row["realized_pnl"]
+
+    return total
+
+
 def daily_realized_pnl(path):
     con = connect(path)
     try:
-        today = datetime.now(MOSCOW).date().isoformat()
-
-        rows = con.execute(
-            "SELECT ts,realized_pnl FROM paper_trades "
-            "WHERE side='SELL'"
-        ).fetchall()
-
-        total = 0.0
-
-        for row in rows:
-            ts = row["ts"]
-            try:
-                trade_date = datetime.fromisoformat(ts).astimezone(
-                    MOSCOW
-                ).date().isoformat()
-            except Exception:
-                trade_date = ts[:10]
-
-            if trade_date == today:
-                total += row["realized_pnl"]
-
-        return total
+        return daily_realized_pnl_from_connection(con)
     finally:
         con.close()
 
@@ -194,6 +197,7 @@ def portfolio_value(path, prices=None):
             })
 
         cash = portfolio["cash"]
+        daily_loss = max(0.0, -daily_realized_pnl_from_connection(con))
 
         return {
             "mode": "PAPER_ONLY",
@@ -202,7 +206,7 @@ def portfolio_value(path, prices=None):
             "position_value": position_value,
             "equity": cash + position_value,
             "unrealized_pnl": unrealized_pnl,
-            "daily_realized_loss": daily_realized_loss(path),
+            "daily_realized_loss": daily_loss,
             "positions": items,
             "limits": {
                 "max_position_value": MAX_POSITION_VALUE,
@@ -230,8 +234,7 @@ def paper_buy(path, symbol, price, qty=None):
         con.execute("BEGIN IMMEDIATE")
 
         portfolio = con.execute(
-            "SELECT cash,initial_capital FROM paper_portfolio "
-            "WHERE id=1"
+            "SELECT cash FROM paper_portfolio WHERE id=1"
         ).fetchone()
 
         if not portfolio:
@@ -240,7 +243,10 @@ def paper_buy(path, symbol, price, qty=None):
 
         cash = portfolio["cash"]
 
-        realized_loss = daily_realized_loss(path)
+        # Read daily realized PnL using the current transaction.
+        realized_loss = max(
+            0.0, -daily_realized_pnl_from_connection(con)
+        )
 
         if realized_loss >= MAX_DAILY_LOSS:
             con.rollback()
