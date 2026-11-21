@@ -1,71 +1,80 @@
+
 import json
 import urllib.request
-import urllib.parse
 from datetime import datetime, timezone
 
 TICKERS = ["SBER", "LKOH", "YDEX", "ROSN", "GMKN", "OZON", "VTBR", "T"]
 
+
 def get_market_snapshot():
     quotes = []
+    errors = []
 
     for ticker in TICKERS:
         try:
             url = (
                 f"https://iss.moex.com/iss/engines/stock/"
                 f"markets/shares/securities/{ticker}.json?"
-                "iss.only=marketdata&"
-                "iss.columns=SECID,BOARDID,LAST,LCURRENTPRICE,"
-                "MARKETPRICE,PREVPRICE,TRADEDATE,TRADETIME"
+                "iss.only=marketdata,securities&"
+                "marketdata.columns=SECID,BOARDID,LAST,LCURRENTPRICE,"
+                "MARKETPRICE,TRADEDATE,TRADETIME&"
+                "securities.columns=SECID,PREVPRICE"
             )
 
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "TradingAgents/1.0"}
+                headers={"User-Agent": "TradingAgents/2.0"}
             )
 
             with urllib.request.urlopen(req, timeout=10) as response:
                 data = json.loads(response.read().decode("utf-8"))
 
-            block = data.get("marketdata", {})
-            columns = block.get("columns", [])
-            rows = block.get("data", [])
+            md = data.get("marketdata", {})
+            sec = data.get("securities", {})
 
-            if not rows:
+            md_columns = md.get("columns", [])
+            md_rows = md.get("data", [])
+
+            sec_columns = sec.get("columns", [])
+            sec_rows = sec.get("data", [])
+
+            if not md_rows:
+                errors.append({"ticker": ticker, "error": "No marketdata rows"})
                 continue
 
-            row = rows[0]
-            item = dict(zip(columns, row))
+            md_item = dict(zip(md_columns, md_rows[0]))
+            sec_item = dict(zip(sec_columns, sec_rows[0])) if sec_rows else {}
 
             price = (
-                item.get("LAST")
-                or item.get("LCURRENTPRICE")
-                or item.get("MARKETPRICE")
+                md_item.get("LAST")
+                or md_item.get("LCURRENTPRICE")
+                or md_item.get("MARKETPRICE")
             )
 
-            if price is None or price <= 0:
+            previous = sec_item.get("PREVPRICE")
+
+            if price is None or float(price) <= 0:
+                errors.append({"ticker": ticker, "error": "Invalid price"})
                 continue
 
             quotes.append({
                 "ticker": ticker,
                 "price": float(price),
-                "previous": item.get("PREVPRICE"),
-                "board": item.get("BOARDID"),
-                "trade_date": item.get("TRADEDATE"),
-                "trade_time": item.get("TRADETIME")
+                "previous": float(previous) if previous is not None else None,
+                "board": md_item.get("BOARDID"),
+                "trade_date": md_item.get("TRADEDATE"),
+                "trade_time": md_item.get("TRADETIME")
             })
 
         except Exception as e:
-            quotes.append({
-                "ticker": ticker,
-                "error": str(e)
-            })
+            errors.append({"ticker": ticker, "error": str(e)})
 
-    valid = [q for q in quotes if "price" in q]
+    valid = [q for q in quotes if q.get("price") is not None]
 
     return {
         "status": "ok" if valid else "no_verified_quotes",
         "source": "MOEX ISS",
         "as_of": datetime.now(timezone.utc).isoformat(),
         "quotes": valid,
-        "errors": [q for q in quotes if "error" in q]
+        "errors": errors
     }
